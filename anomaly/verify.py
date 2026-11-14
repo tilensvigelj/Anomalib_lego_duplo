@@ -19,6 +19,7 @@ import numpy as np
 
 from .config import (
     load_model_config,
+    load_rules,
     save_export_calibration,
     update_rules_threshold,
 )
@@ -26,6 +27,8 @@ from .detector import (
     EnsembleAnomalyDetector,
     SingleModelDetector,
     discover_exports,
+    required_majority_votes,
+    resolve_model_device,
 )
 
 
@@ -87,7 +90,7 @@ def calibrate_single_threshold(good_scores: Sequence[float], defect_scores: Sequ
 
 def evaluate_single_model(
     export_name: str,
-    device: str = "CPU",
+    device: str = "AUTO_INTEL",
     processed_dir: str | Path = "./data/processed/mat",
     exports_root: str | Path = "./anomaly/exports",
     cache_dir: str | Path = "./anomaly/ov_cache",
@@ -97,6 +100,7 @@ def evaluate_single_model(
     update_default: bool = True,
 ) -> dict:
     mcfg = load_model_config(config_path)
+    rules = load_rules(rules_path)
     xml_path = Path(exports_root) / export_name / "weights" / "openvino" / "model.xml"
     if not xml_path.is_file():
         raise FileNotFoundError(f"OpenVINO IR not found at {xml_path}. Run `python -m anomaly.export` first.")
@@ -109,6 +113,7 @@ def evaluate_single_model(
         chroma_thresh=mcfg.color_dev_chroma_thresh,
         dark_thresh=mcfg.color_dev_dark_thresh,
         min_defect_area_px=mcfg.min_defect_area_px,
+        rules=rules,
     )
 
     base = Path(processed_dir)
@@ -143,6 +148,7 @@ def evaluate_single_model(
 
     report = {
         "model": export_name,
+        "preferred_device": detector.preferred_device,
         "active_device": detector.active_device,
         "num_good_scored": len(good_scores),
         "num_defect_scored": len(defect_scores),
@@ -159,7 +165,7 @@ def evaluate_single_model(
 
 def evaluate_ensemble_sweep(
     export_spec: str = "auto",
-    device: str = "CPU",
+    device: str = "AUTO_INTEL",
     processed_dir: str | Path = "./data/processed/mat",
     exports_root: str | Path = "./anomaly/exports",
     cache_dir: str | Path = "./anomaly/ov_cache",
@@ -167,7 +173,7 @@ def evaluate_ensemble_sweep(
     rules_path: str | Path = "./configs/rules.yaml",
     update_rules: bool = False,
 ) -> dict:
-    """Calibrate each available model (`PatchCore` + `PaDiM`) and verify their parallel binary ensemble."""
+    """Calibrate each available model (`PatchCore` + `PaDiM` + `EfficientAd`) and verify 2/3 majority voting."""
     names = discover_exports(exports_root, requested=export_spec, enable_ensemble=True)
     if not names:
         raise FileNotFoundError(f"No exported OpenVINO models found under {exports_root}")
@@ -204,6 +210,7 @@ def evaluate_ensemble_sweep(
         model_thresholds[name] = float(rep["recommended_threshold"])
 
     mcfg = load_model_config(config_path)
+    rules = load_rules(rules_path)
     ens_threads = max(2, (os.cpu_count() or 8) // len(names))
     sub_detectors = [
         SingleModelDetector(
@@ -215,6 +222,7 @@ def evaluate_ensemble_sweep(
             dark_thresh=mcfg.color_dev_dark_thresh,
             min_defect_area_px=mcfg.min_defect_area_px,
             cpu_threads=ens_threads,
+            rules=rules,
         )
         for name in names
     ]
@@ -253,6 +261,9 @@ def evaluate_ensemble_sweep(
         "mode": "ensemble_verification",
         "ensemble_model": ensemble.model_name,
         "ensemble_size": len(names),
+        "voting_rule": f"{required_majority_votes(len(names))}/{len(names)}_majority",
+        "preferred_devices": ensemble.preferred_device,
+        "active_devices": ensemble.active_device,
         "parallel_execution": True,
         "num_good_scored": len(ens_good_verdicts),
         "num_defect_scored": len(ens_def_verdicts),
@@ -278,14 +289,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--export-name",
         default="auto",
-        help="Model export name, 'a+b' pair, or 'auto' (default: calibrates & combines PatchCore + PaDiM)",
+        help="Model export name, 'a+b+c' tuple, or 'auto' (default: calibrates & combines PatchCore + PaDiM + EfficientAd)",
     )
     parser.add_argument(
         "--single-model",
         action="store_true",
-        help="Disable automatic PatchCore + PaDiM ensemble calibration when --export-name is 'auto'",
+        help="Disable automatic PatchCore + PaDiM + EfficientAd ensemble calibration when --export-name is 'auto'",
     )
-    parser.add_argument("--device", default="CPU")
+    parser.add_argument(
+        "--device",
+        default="AUTO_INTEL",
+        help="OpenVINO device ('AUTO_INTEL' routes EfficientAd->NPU and PatchCore/PaDiM->GPU; or force 'CPU'/'GPU'/'NPU')",
+    )
     parser.add_argument("--processed-dir", default="./data/processed/mat")
     parser.add_argument("--exports-root", default="./anomaly/exports")
     parser.add_argument("--rules", default="./configs/rules.yaml")

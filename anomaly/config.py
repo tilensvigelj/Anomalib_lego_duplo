@@ -13,6 +13,27 @@ import yaml
 DEFAULT_DEFECT_CONFIG = Path("configs/defect_config.json")
 DEFAULT_RULES_YAML = Path("configs/rules.yaml")
 
+DEFAULT_FAMILY_DEVICES: dict[str, str] = {
+    "efficient_ad": "NPU",
+    "patchcore": "GPU",
+    "padim": "GPU",
+    "mh_patchcore": "GPU",
+    "found_ad": "GPU",
+}
+
+MODEL_TYPE_ALIASES: dict[str, str] = {
+    "efficientad": "efficient_ad",
+    "efficientaid": "efficient_ad",
+    "efficient_aid": "efficient_ad",
+    "pathcore": "patchcore",
+}
+
+
+def normalize_model_type(model_type: str) -> str:
+    """Normalize CLI/config model names (e.g. `efficientad` / `efficientaid` -> `efficient_ad`)."""
+    cleaned = str(model_type).strip().lower().replace("-", "_")
+    return MODEL_TYPE_ALIASES.get(cleaned, cleaned)
+
 
 @dataclass
 class ModelConfig:
@@ -59,9 +80,13 @@ def load_rules(rules_path: str | Path = DEFAULT_RULES_YAML) -> dict[str, Any]:
                 "defective": "put the brick in the pink bin",
             },
             "threshold": 0.50,
-            "anomaly_device": "CPU",
+            "anomaly_device": "AUTO_INTEL",
+            "family_devices": dict(DEFAULT_FAMILY_DEVICES),
         }
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if "family_devices" not in loaded or not isinstance(loaded.get("family_devices"), Mapping):
+        loaded["family_devices"] = dict(DEFAULT_FAMILY_DEVICES)
+    return loaded
 
 
 def update_rules_threshold(

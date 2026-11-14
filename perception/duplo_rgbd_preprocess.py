@@ -80,6 +80,11 @@ class PreprocessConfig:
     REJECT_BORDER_TOUCH: bool = True
     MAKE_DEBUG_OVERLAY: bool = True
     MAX_SEG_DIM: int = 640
+    REMOVE_GLARE: bool = True
+    GLARE_MIN_L: float = 212.0
+    GLARE_PROMINENCE: float = 16.0
+    GLARE_MAX_SAT: float = 48.0
+    GLARE_INPAINT_RADIUS: int = 4
 
     def to_json(self, path: str | Path) -> None:
         out_path = Path(path)
@@ -955,6 +960,112 @@ def _canonicalize_and_crop(
     return cropped_rgb, cropped_mask, float(total_angle), global_crop_box
 
 
+def remove_specular_glare(
+    crop_rgb: np.ndarray,
+    mask_u8: np.ndarray | None,
+    cfg: PreprocessConfig = PreprocessConfig(),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Detect and remove specular lamp glare/reflections inside the Duplo brick mask.
+
+    Uses the Dichromatic Reflection Model on plastic (`I = I_diffuse + I_specular`):
+    1. Computes masked normalized local luminance (`L_local`) strictly inside the eroded brick
+       mask so the neutral gray `(128, 128, 128)` background border never biases edge pixels.
+    2. Flags specular glare cores that are simultaneously:
+       - high in absolute brightness (`V >= GLARE_MIN_L` and above brick median lightness),
+       - a local luminance peak (`L - L_local >= GLARE_PROMINENCE`, so flat white bricks are untouched),
+       - desaturated/bleached toward white (`S <= GLARE_MAX_SAT` or `< 0.55 * median_S` at `V >= 225`),
+       ensuring dark and colored marker strokes are 100% preserved.
+    3. Expands `2 px` into the bright glare halo and reconstructs diffuse plastic appearance via
+       Telea fast-marching inpainting with smooth `1 px` Gaussian feathering.
+    """
+    h, w, _ = crop_rgb.shape
+    empty_glare = np.zeros((h, w), dtype=np.uint8)
+    if not cfg.REMOVE_GLARE:
+        return crop_rgb, empty_glare
+
+    if mask_u8 is None:
+        bg_arr = np.array(cfg.BG_FILL, dtype=np.int16)
+        fg_raw = (np.max(np.abs(crop_rgb.astype(np.int16) - bg_arr), axis=2) > 6).astype(np.uint8) * 255
+    else:
+        fg_raw = np.where(mask_u8 > 0, 255, 0).astype(np.uint8)
+
+    # Erode 3px inside the brick silhouette so the feathered BG_FILL border is never touched
+    fg_interior_u8 = cv2.erode(fg_raw, _ellipse_kernel(5), iterations=1)
+    fg = fg_interior_u8 > 0
+    brick_area = int(np.count_nonzero(fg))
+    if brick_area < 64:
+        return crop_rgb, empty_glare
+
+    hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2LAB)
+    sat = hsv[:, :, 1].astype(np.float32)
+    val = hsv[:, :, 2].astype(np.float32)
+    luma = lab[:, :, 0].astype(np.float32)
+
+    # Masked normalized Gaussian blur (sigma=9) computes local diffuse neighborhood strictly inside brick
+    fg_f = fg.astype(np.float32)
+    num_blur = cv2.GaussianBlur(luma * fg_f, (0, 0), sigmaX=9.0, sigmaY=9.0)
+    den_blur = cv2.GaussianBlur(fg_f, (0, 0), sigmaX=9.0, sigmaY=9.0)
+    l_local = num_blur / np.maximum(den_blur, 1e-4)
+    prominence = luma - l_local
+
+    med_l = float(np.median(luma[fg]))
+    med_s = float(np.median(sat[fg]))
+
+    bleached_white = sat <= float(cfg.GLARE_MAX_SAT)
+    bleached_chromatic = (med_s >= 70.0) & (sat <= (med_s * 0.55)) & (val >= 225.0)
+
+    glare_core = (
+        fg
+        & (val >= float(cfg.GLARE_MIN_L))
+        & (luma >= max(202.0, min(245.0, med_l + 10.0)))
+        & (prominence >= float(cfg.GLARE_PROMINENCE))
+        & (bleached_white | bleached_chromatic)
+    )
+    if not np.any(glare_core):
+        return crop_rgb, empty_glare
+
+    # Filter connected components: drop 1px sensor noise and reject broad uniform lit faces (>22% of brick)
+    max_glare_area = max(16, int(round(brick_area * 0.22)))
+    num_lbl, lbls, stats, _ = cv2.connectedComponentsWithStats(glare_core.astype(np.uint8), connectivity=8)
+    filtered_core = np.zeros((h, w), dtype=np.uint8)
+    for idx in range(1, num_lbl):
+        area_i = int(stats[idx, cv2.CC_STAT_AREA])
+        if 2 <= area_i <= max_glare_area:
+            filtered_core[lbls == idx] = 255
+
+    if not np.any(filtered_core):
+        return crop_rgb, empty_glare
+
+    # Expand 2px into bright glare halo so Telea inpainting samples true diffuse plastic color, not bright rim
+    halo_cand = fg & (prominence >= 5.0) & (val >= (float(cfg.GLARE_MIN_L) - 28.0))
+    dilated = cv2.dilate(filtered_core, _ellipse_kernel(5), iterations=1) > 0
+    glare_mask = np.where(
+        (filtered_core > 0) | (dilated & halo_cand),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    inpaint_r = max(2, int(cfg.GLARE_INPAINT_RADIUS))
+    repaired_bgr = cv2.inpaint(
+        cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR),
+        glare_mask,
+        inpaintRadius=float(inpaint_r),
+        flags=cv2.INPAINT_TELEA,
+    )
+    repaired_rgb = cv2.cvtColor(repaired_bgr, cv2.COLOR_BGR2RGB)
+
+    # Smooth 1px alpha feather on the repaired glare boundary for invisible transitions
+    alpha = cv2.GaussianBlur(glare_mask.astype(np.float32) * (1.0 / 255.0), (0, 0), sigmaX=1.0, sigmaY=1.0)
+    alpha = alpha * fg_f
+    blended = (
+        alpha[:, :, None] * repaired_rgb.astype(np.float32)
+        + (1.0 - alpha[:, :, None]) * crop_rgb.astype(np.float32)
+    )
+    out_rgb = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+    return out_rgb, glare_mask
+
+
 def create_debug_overlay(
     color_rgb: np.ndarray,
     full_mask_u8: np.ndarray,
@@ -1100,6 +1211,8 @@ def preprocess(
         processed_rgb, cropped_mask, crop_box = _square_crop_and_resize(fg_rgb, mask_u8, cfg)
         rot_angle = 0.0
 
+    processed_rgb, glare_mask = remove_specular_glare(processed_rgb, cropped_mask, cfg)
+
     bbox = cv2.boundingRect(mask_u8)
     info: dict[str, Any] = {
         "valid": True,
@@ -1108,6 +1221,7 @@ def preprocess(
         "crop_box": tuple(int(v) for v in crop_box),
         "area": final_area,
         "rotation_angle": float(rot_angle),
+        "glare_pixels_removed": int(np.count_nonzero(glare_mask > 0)),
         "full_mask": mask_u8,
         "debug_overlay": None,
     }

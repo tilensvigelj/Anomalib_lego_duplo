@@ -75,7 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--model",
         default="auto",
-        help="Export name(s) under anomaly/exports/ (default: 'auto' runs PatchCore + PaDiM in parallel).",
+        help="Export name(s) under anomaly/exports/ (default: 'auto' runs PatchCore + PaDiM + EfficientAd in parallel).",
     )
     parser.add_argument("--single-model", action="store_true", help="Run single model instead of ensemble.")
     parser.add_argument("--exports-root", default="./anomaly/exports")

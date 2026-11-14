@@ -10,6 +10,7 @@ from .duplo_rgbd_preprocess import (
     load_background_model,
     preprocess,
     process_dataset_batch,
+    remove_specular_glare,
     run_acceptance_test,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "load_background_model",
     "preprocess",
     "process_dataset_batch",
+    "remove_specular_glare",
     "run_acceptance_test",
 ]

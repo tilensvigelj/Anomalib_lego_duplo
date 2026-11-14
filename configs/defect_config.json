@@ -27,6 +27,11 @@
     "OUT_SIZE": 256,
     "COLOR_FORMAT": "RGB",
     "CANONICALIZE_ROTATION": true,
-    "REJECT_BORDER_TOUCH": true
+    "REJECT_BORDER_TOUCH": true,
+    "REMOVE_GLARE": true,
+    "GLARE_MIN_L": 212.0,
+    "GLARE_PROMINENCE": 16.0,
+    "GLARE_MAX_SAT": 48.0,
+    "GLARE_INPAINT_RADIUS": 4
   }
 }

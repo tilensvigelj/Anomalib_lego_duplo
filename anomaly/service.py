@@ -3,8 +3,9 @@
 
 Contract:
 - Accepts raw full-camera frames OR 256x256 crops over ZeroMQ `REP` (JSON `{"image": "<base64_png>"}`,
-  plain base64 image string, or raw PNG/JPEG bytes), runs realtime background subtraction + cropping
-  automatically when given a full-frame camera photo, and evaluates `PatchCore + PaDiM` in parallel.
+  plain base64 image string, or raw PNG/JPEG bytes), runs realtime background subtraction + glare removal + cropping
+  automatically when given a full-frame camera photo, and evaluates `PatchCore (GPU) + PaDiM (GPU) + EfficientAd (NPU)`
+  in parallel with threshold normalization and **2/3 majority voting**.
 - Replies with ONLY the plain string `"perfect"` or `"defective"`.
 - Cleanly exits within <200ms on `Ctrl+C` (`SIGINT` / `SIGTERM`) on both Windows and Linux.
 """
@@ -59,6 +60,7 @@ class AnomalyZMQService:
         defect_cfg_path: str | Path = "./configs/defect_config.json",
         calibration_dir: str | Path = "./data/calibration",
         cache_dir: str | Path = "./anomaly/ov_cache",
+        device: str | None = None,
         enable_ensemble: bool = True,
     ) -> None:
         self.evaluator = BrickAnomalyEvaluator(
@@ -68,6 +70,7 @@ class AnomalyZMQService:
             defect_cfg_path=defect_cfg_path,
             calibration_dir=calibration_dir,
             cache_dir=cache_dir,
+            device=device,
             enable_ensemble=enable_ensemble,
         )
         self.detector = self.evaluator.detector
@@ -200,13 +203,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--model",
         default="auto",
-        help="Export dir name(s) under anomaly/exports/ (default: 'auto' pairs latest PatchCore + PaDiM)",
+        help="Export dir name(s) under anomaly/exports/ (default: 'auto' runs PatchCore + PaDiM + EfficientAd in parallel)",
     )
     parser.add_argument(
         "--single-model",
         action="store_true",
-        help="Disable automatic PatchCore + PaDiM parallel ensemble pairing",
+        help="Disable automatic PatchCore + PaDiM + EfficientAd parallel ensemble",
     )
+    parser.add_argument("--device", default=None, help="Override OpenVINO device (default: AUTO_INTEL -> EfficientAd=NPU, PatchCore/PaDiM=GPU)")
     parser.add_argument("--exports-root", default="./anomaly/exports")
     parser.add_argument("--rules", default="./configs/rules.yaml")
     args = parser.parse_args(argv)
@@ -215,6 +219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_export=args.model,
         exports_root=args.exports_root,
         rules_path=args.rules,
+        device=args.device,
         enable_ensemble=not args.single_model,
     )
     try:

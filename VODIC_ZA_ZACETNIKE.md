@@ -1,6 +1,6 @@
 # Vodič od ničle: Kaj se tukaj dogaja in kako vse skupaj deluje?
 
-Ta dokument razlaga celoten sistem **od popolne ničle** — za **eno kamero**, vzporedni ansambel **`PatchCore + PaDiM`** in neposredni izhod za VLA (**`"perfect"`** ali **`"defective"`**).
+Ta dokument razlaga celoten sistem **od popolne ničle** — za **eno kamero**, vzporedni 3-modelni ansambel **`PatchCore + PaDiM + EfficientAd`** (razporejen na **Intel GPU + NPU** z glasovanjem **2/3**) in neposredni izhod za VLA (**`"perfect"`** ali **`"defective"`**).
 
 ---
 
@@ -21,15 +21,17 @@ Ni nobenega vmesnega stanja in nobene druge kamere — en sam prag odloči takoj
 
 ## 2. Katere knjižnice uporabljamo (razloženo po domače)
 
-1. **OpenCV (`cv2`) in NumPy — Izrez kocke brez senc (`perception/`)**
-   - Primerja fotografijo kocke s fotografijo prazne mize (`data/calibration/background_mat.png`), odstrani sence na mizi, izreže samo kocko na enakomerno sivo ozadje in jo shrani v velikosti **256 × 256 pikslov**.
-2. **Anomalib (`PatchCore` + `PaDiM`) — Detektor odstopanj (`anomaly/`)**
+1. **OpenCV (`cv2`) in NumPy — Izrez kocke brez senc in odbleskov (`perception/`)**
+   - Primerja fotografijo kocke s fotografijo prazne mize (`data/calibration/background_mat.png`), odstrani sence na mizi, z metodo `remove_specular_glare` zgladi ostre bele odbleske luči na plastiki (brez brisanja flomastra!) ter izreže kocko na sivo ozadje v velikosti **256 × 256 pikslov**.
+2. **Anomalib (`PatchCore` + `PaDiM` + `EfficientAd`) — 3-modelni ansambel z 2/3 glasovanjem (`anomaly/`)**
    - Med učenjem vidi **samo čiste kocke** (`data/processed/mat/train/good/`).
-   - Ob pregledu nove slike za vsak delček kocke izračuna oceno odstopanja (`score`):
-     - **`patchcore` (utež 65 %)**: odličen za drobne lokalne pikice in črtice flomastra (~2 min učenja na CPU).
-     - **`padim` (utež 35 %)**: hiter prostorski model (~1 min učenja), ki dopolnjuje `PatchCore`.
-3. **OpenVINO — Vzporedni C++ pogon**
-   - Pretvori oba modela v hitri datoteki `model.xml` + `model.bin` in ju izvaja **hkrati (vzporedno)** v C++ v ~43 ms na CPU.
+   - Vsak model svojo surovo oceno najprej **normalizira glede na svoj kalibrirani prag** (`norm_i = score_i / threshold_i`, kjer `>= 1.0` pomeni glas za `"defective"`):
+     - **`patchcore` (`GPU`)**: lokalni iskalnik najbližjih sosedov, odličen za drobne pikice in praske.
+     - **`padim` (`GPU`)**: prostorski Gaussov model po mestih kocke.
+     - **`efficient_ad` (`NPU`)**: hitra učitelj-učenec nevronska mreža s simetričnimi konvolucijami za Intel NPU.
+   - Končna odločitev je sprejeta po principu **večine 2/3** (vsaj **2 od 3** modelov morata glasovati za `"defective"`).
+3. **OpenVINO — Vzporedno izvajanje na Intel `NPU` + `GPU`**
+   - Vsi trije modeli tečejo **istočasno (`start_async`)**: `EfficientAd` na **Intel NPU**, `PatchCore` in `PaDiM` pa vzporedno na **Intel Arc GPU** (s samodejnim varnostnim preklopom na `CPU`, če naprava ni prisotna).
 4. **ZeroMQ (`zmq`) — Povezava z VLA (`tcp://127.0.0.1:5555`)**
    - Sprejme sliko (JSON `{"image": "<base64>"}`, navaden base64 niz ali surove PNG bajte) in odgovori s čistim nizom `"perfect"` ali `"defective"`.
 
@@ -48,16 +50,18 @@ Ni nobenega vmesnega stanja in nobene druge kamere — en sam prag odloči takoj
          │
          ▼  python -m perception.augment_hue            (opcijsko: dodatne barve čistih kock)
          │
-         ▼  python -m anomaly.train --model padim --version 3
-         ▼  python -m anomaly.train --model patchcore --version 4
-[3. Natrenirana modela]       anomaly/results/padim_mat_v3/ in patchcore_mat_v4/
+         ▼  python -m anomaly.train --model padim --version 1
+         ▼  python -m anomaly.train --model patchcore --version 1
+         ▼  python -m anomaly.train --model efficient_ad --version 1
+[3. Natrenirani modeli]       anomaly/results/{padim,patchcore,efficient_ad}_mat_v1/
          │
-         ▼  python -m anomaly.export --model padim --version 3 --precision fp16
-         ▼  python -m anomaly.export --model patchcore --version 4 --precision fp16
-[4. Hitra OpenVINO modela]    anomaly/exports/{padim_mat_v3, patchcore_mat_v4}/weights/openvino/model.xml
+         ▼  python -m anomaly.export --model padim --version 1 --precision fp16
+         ▼  python -m anomaly.export --model patchcore --version 1 --precision fp16
+         ▼  python -m anomaly.export --model efficient_ad --version 1 --precision fp16
+[4. Hitri OpenVINO modeli]    anomaly/exports/{padim,patchcore,efficient_ad}_mat_v1/weights/openvino/model.xml
          │
-         ▼  python -m anomaly.verify --device CPU --update-rules
-[5. Enotni prag v pravilih]   configs/rules.yaml  (zapiše se en sam `threshold` za vsak model)
+         ▼  python -m anomaly.verify --device AUTO_INTEL --update-rules
+[5. Kalibrirani pragovi]      configs/rules.yaml  (prag za vsak model + razporeditev NPU/GPU + 2/3 glasovanje)
          │
          ▼  python -m anomaly.service
 [6. Živi servis za VLA]       Posluša na tcp://127.0.0.1:5555 -> vrne "perfect" ali "defective"
@@ -85,7 +89,7 @@ Odločitev temelji na **enem samem pragu (`threshold`)** brez vmesnega območja:
 
 Samodejna kalibracija (nastavi prag tako, da ujame 100 % popisanih testnih kock v `test/defect`):
 ```powershell
-python -m anomaly.verify --device CPU --update-rules
+python -m anomaly.verify --device AUTO_INTEL --update-rules
 ```
 Ročna prilagoditev v `configs/rules.yaml` (bere se sproti ob vsakem klicu brez ponovnega zagona servisa!):
 - Če čiste kocke prepogosto dobijo `"defective"` -> rahlo **zvišaj** vrednost v `model_thresholds:` (npr. `patchcore_mat_v4` iz `0.025` na `0.030`).

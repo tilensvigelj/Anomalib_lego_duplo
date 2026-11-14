@@ -2,7 +2,11 @@ verdict_to_task:
   perfect: put the brick in the blue output bin
   defective: put the brick in the pink bin
 threshold: 0.1574
-anomaly_device: CPU
+anomaly_device: AUTO_INTEL
+family_devices:
+  efficient_ad: NPU
+  patchcore: GPU
+  padim: GPU
 model_thresholds:
   patchcore_mat_v4: 0.02695
   padim_mat_v3: 0.1282

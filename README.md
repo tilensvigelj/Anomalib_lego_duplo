@@ -1,7 +1,7 @@
 # `j26` — Junction 2026 Intel Physical AI (Person C: Perception & Anomalib)
 
-Single-camera Duplo anomaly detection pipeline (`perception/`, `anomaly/`, `data/`, `configs/rules.yaml`).
-ZeroMQ service (`tcp://127.0.0.1:5555`) evaluates incoming camera frames using a parallel OpenVINO `PatchCore + PaDiM` ensemble and replies to the VLA with **only** `"perfect"` or `"defective"`.
+Single-camera Duplo anomaly detection pipeline (`perception/`, `anomaly/`, `data/`, `configs/rules.yaml`) optimized for **Intel Core Ultra laptops (`GPU` + `NPU`)**.
+ZeroMQ service (`tcp://127.0.0.1:5555`) removes shadows & specular glare, evaluates incoming camera frames using a **3-model parallel OpenVINO ensemble** (`PatchCore` on `GPU` + `PaDiM` on `GPU` + `EfficientAd` on `NPU`) with per-model threshold normalization and **2/3 majority voting**, and replies to the VLA with **only** `"perfect"` or `"defective"`.
 
 ```text
 j26/
@@ -41,27 +41,29 @@ j26/
    - `data/raw/mat/test/good/` (held-out clean bricks)
    - `data/raw/mat/test/defect/` (bricks with marker marks)
 
-### Step 2: Subtract Background & Crop to `256x256` (`data/processed/mat/`)
+### Step 2: Subtract Background, Remove Specular Glare & Crop to `256x256` (`data/processed/mat/`)
 ```bash
-# Aligns lighting per frame, removes cast/bounce shadows, and writes 256x256 crops to data/processed/mat/
+# Aligns lighting per frame, removes cast/bounce shadows + lamp glare hotspots, and writes 256x256 crops
 python -m perception.preprocess
 
 # Optional: generate hue-shifted copies in train/good to cover unseen brick colors
 python -m perception.augment_hue
 ```
 
-### Step 3: Train, Export OpenVINO IR, Calibrate Threshold & Start Service
+### Step 3: Train 3-Model Ensemble, Export OpenVINO IR, Calibrate Thresholds & Start Service
 ```bash
-# 1. Train Anomalib 2.7.0 models (padim ~1 min, CPU-optimized patchcore ~2 min)
-python -m anomaly.train --model padim --version 3
-python -m anomaly.train --model patchcore --version 4
+# 1. Train Anomalib 2.7.0 3-model ensemble (Padim + PatchCore + EfficientAd)
+python -m anomaly.train --model padim --version 1
+python -m anomaly.train --model patchcore --version 1
+python -m anomaly.train --model efficient_ad --version 1
 
 # 2. Export to static [1, 3, 256, 256] OpenVINO IR -> anomaly/exports/<model>_mat_v<N>/weights/openvino/model.xml
-python -m anomaly.export --model padim --version 3 --precision fp16
-python -m anomaly.export --model patchcore --version 4 --precision fp16
+python -m anomaly.export --model padim --version 1 --precision fp16
+python -m anomaly.export --model patchcore --version 1 --precision fp16
+python -m anomaly.export --model efficient_ad --version 1 --precision fp16
 
-# 3. Calibrate single binary threshold per model into configs/rules.yaml & verify parallel ensemble
-python -m anomaly.verify --device CPU --update-rules
+# 3. Calibrate per-model thresholds into configs/rules.yaml & verify 2/3 majority ensemble (EfficientAd->NPU, PatchCore/PaDiM->GPU)
+python -m anomaly.verify --device AUTO_INTEL --update-rules
 
 # 4. Inspect any single photo locally (prints JSON or --verdict-only 'perfect'/'defective' + optional heatmap PNG)
 python -m anomaly.evaluate \

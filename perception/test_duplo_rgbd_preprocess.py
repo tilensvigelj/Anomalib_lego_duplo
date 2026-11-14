@@ -19,6 +19,7 @@ from perception.duplo_rgbd_preprocess import (
     get_rotations_rgb,
     preprocess,
     process_dataset_batch,
+    remove_specular_glare,
     run_acceptance_test,
 )
 
@@ -358,6 +359,59 @@ class TestDuploRGBPreprocess(unittest.TestCase):
 
             rots = get_rotations_rgb(frames[0][0][:256, :256], angles=(0, 90, 180, 270))
             self.assertEqual(len(rots), 4)
+
+    def test_specular_glare_removal_preserves_defects_and_white_bricks(self) -> None:
+        """Specular lamp reflections must be inpainted out while dark/colored defects and white bricks stay intact."""
+        cfg = PreprocessConfig(REMOVE_GLARE=True)
+
+        # 1. Red Duplo brick with a bright desaturated lamp glare hotspot AND a dark marker stroke right next to it
+        color, gt_mask = _make_synthetic_duplo_rgb_scene(
+            brick_rgb=(205, 38, 34),
+            cast_shadow=False,
+            low_contrast_patch=False,
+            noise_std=2.0,
+            rng_seed=777,
+        )
+        scene_glare = color.copy()
+        # Paint a realistic specular lamp glare spot (bright desaturated core + soft halo) on the brick
+        glare_layer = np.zeros_like(scene_glare, dtype=np.float32)
+        cv2.ellipse(glare_layer, (305, 236), (11, 6), 15.0, 0.0, 360.0, (255.0, 255.0, 255.0), -1)
+        glare_alpha = cv2.GaussianBlur(glare_layer[:, :, 0] / 255.0, (0, 0), sigmaX=2.2)[:, :, None]
+        scene_glare = np.clip(
+            np.rint((1.0 - glare_alpha) * scene_glare.astype(np.float32) + glare_alpha * 252.0),
+            0,
+            255,
+        ).astype(np.uint8)
+        # Paint a dark marker scratch right next to the glare spot
+        cv2.line(scene_glare, (332, 226), (355, 248), (18, 18, 20), thickness=4)
+
+        crop_no_glare_rm, mask_ref, _ = preprocess(scene_glare, self.bg_model, replace(cfg, REMOVE_GLARE=False))
+        crop_cleaned, _, info_clean = preprocess(scene_glare, self.bg_model, cfg)
+
+        self.assertTrue(info_clean["valid"])
+        self.assertGreater(info_clean["glare_pixels_removed"], 20)
+
+        # Bright white peak inside the brick mask must drop substantially back toward diffuse red plastic
+        brick_sel = mask_ref > 0
+        max_luma_before = float(np.max(np.mean(crop_no_glare_rm[brick_sel], axis=1)))
+        max_luma_after = float(np.max(np.mean(crop_cleaned[brick_sel], axis=1)))
+        self.assertGreater(max_luma_before, 240.0)
+        self.assertLess(max_luma_after, 215.0)
+
+        # Dark marker defect pixels must remain dark and untouched!
+        dark_before = int(np.count_nonzero(np.mean(crop_no_glare_rm[brick_sel], axis=1) < 45.0))
+        dark_after = int(np.count_nonzero(np.mean(crop_cleaned[brick_sel], axis=1) < 45.0))
+        self.assertGreater(dark_before, 25)
+        self.assertAlmostEqual(dark_after, dark_before, delta=3)
+
+        # 2. Clean matte white Duplo brick without sharp glare spikes must NOT be darkened
+        white_crop = np.full((256, 256, 3), 128, dtype=np.uint8)
+        white_mask = np.zeros((256, 256), dtype=np.uint8)
+        cv2.rectangle(white_mask, (48, 72), (208, 184), 255, -1)
+        white_crop[white_mask > 0] = np.array([236, 238, 240], dtype=np.uint8)
+        white_out, white_glare = remove_specular_glare(white_crop, white_mask, cfg)
+        self.assertEqual(int(np.count_nonzero(white_glare)), 0)
+        np.testing.assert_array_equal(white_out, white_crop)
 
 
 if __name__ == "__main__":

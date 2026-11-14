@@ -1,8 +1,12 @@
-"""Single-camera OpenVINO anomaly detector (`PatchCore` + `PaDiM` parallel ensemble).
+"""Single-camera OpenVINO anomaly detector (`PatchCore` + `PaDiM` + `EfficientAd` parallel ensemble).
 
-Outputs a strict binary verdict:
-- `"perfect"`   (`normalized_score < 1.0`, i.e. `score < threshold`)
-- `"defective"` (`normalized_score >= 1.0`, i.e. `score >= threshold`, or invalid preprocess crop)
+Hardware & Voting Architecture (Intel Core Ultra Laptop):
+- `EfficientAd` -> Intel `NPU` (with static `[1, 3, 256, 256]` shape + graceful fallback)
+- `PatchCore`   -> Intel `GPU` (Arc / Xe iGPU FP16 async queue)
+- `PaDiM`       -> Intel `GPU` (Arc / Xe iGPU FP16 async queue)
+- All 3 models execute in parallel via C++ `ov.InferRequest.start_async()`.
+- Raw scores are normalized by each model's calibrated threshold (`norm_i = raw_i / threshold_i`),
+  and the ensemble decides `"defective"` vs `"perfect"` by **2/3 majority vote**.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from dataclasses import replace
+import math
 import os
 from pathlib import Path
 import re
@@ -17,7 +22,6 @@ import threading
 import time
 from typing import Any, Literal, Sequence
 
-from anomalib.deploy import OpenVINOInferencer
 import cv2
 import numpy as np
 import openvino as ov
@@ -31,25 +35,67 @@ from perception.duplo_rgbd_preprocess import (
 )
 
 from .config import (
+    DEFAULT_FAMILY_DEVICES,
     load_export_calibration,
     load_model_config,
     load_rules,
+    normalize_model_type,
     parse_threshold_value,
 )
 
 BinaryVerdict = Literal["perfect", "defective"]
 NORM_DEFECT_THRESHOLD = 1.0
-ENSEMBLE_FAMILIES = ("patchcore", "padim")
+ENSEMBLE_FAMILIES = ("patchcore", "padim", "efficient_ad")
+AUTO_DEVICE_TOKENS = {"", "AUTO", "AUTO_INTEL", "HETERO_ENSEMBLE"}
 _VERSION_RE = re.compile(r"_v(\d+)(?:_|$)")
 _SPLIT_SPEC_RE = re.compile(r"[+,]")
 
 
 def _model_family(export_name: str) -> str:
-    low = export_name.lower()
-    for fam in ("mh_patchcore", "patchcore", "padim", "efficient_ad", "found_ad"):
-        if low.startswith(fam):
-            return fam
-    return low.split("_")[0]
+    low = export_name.strip().lower().replace("-", "_")
+    for prefix, canonical in (
+        ("mh_patchcore", "mh_patchcore"),
+        ("patchcore", "patchcore"),
+        ("pathcore", "patchcore"),
+        ("padim", "padim"),
+        ("efficient_ad", "efficient_ad"),
+        ("efficientad", "efficient_ad"),
+        ("efficient_aid", "efficient_ad"),
+        ("efficientaid", "efficient_ad"),
+        ("found_ad", "found_ad"),
+    ):
+        if low.startswith(prefix):
+            return canonical
+    return normalize_model_type(low.split("_")[0])
+
+
+def resolve_model_device(
+    model_name: str,
+    requested_device: str | None = None,
+    rules: Mapping[str, Any] | None = None,
+) -> tuple[str, bool]:
+    """Resolve `(preferred_device, explicit_override)` for `model_name`.
+
+    When `requested_device` is `None` or `"AUTO_INTEL"` (default), routes:
+    - `efficient_ad` -> `"NPU"`
+    - `patchcore`    -> `"GPU"`
+    - `padim`        -> `"GPU"`
+    """
+    req = (requested_device or "").strip()
+    if req.upper() not in AUTO_DEVICE_TOKENS:
+        return req, True
+
+    rule_dev = str((rules or {}).get("anomaly_device", "AUTO_INTEL")).strip()
+    if rule_dev.upper() not in AUTO_DEVICE_TOKENS:
+        return rule_dev, True
+
+    fam = _model_family(model_name)
+    fam_map = (rules or {}).get("family_devices")
+    if isinstance(fam_map, Mapping):
+        mapped = fam_map.get(fam)
+        if mapped:
+            return str(mapped).strip(), False
+    return DEFAULT_FAMILY_DEVICES.get(fam, "GPU"), False
 
 
 def _export_version(export_name: str) -> int:
@@ -62,12 +108,12 @@ def discover_exports(
     requested: str | Sequence[str] | None = "auto",
     enable_ensemble: bool = True,
 ) -> list[str]:
-    """Resolve one or more OpenVINO export names (`PatchCore` + `PaDiM`) for the single camera.
+    """Resolve OpenVINO export names (`PatchCore` + `PaDiM` + `EfficientAd`) for the single camera.
 
-    - If `requested` is `"a+b"` or `"a,b"` or a list, returns those explicit exports.
+    - If `requested` is `"a+b+c"` or `"a,b,c"` or a list, returns those explicit exports.
     - If `requested` is `None` or `"auto"` and `enable_ensemble=True`, automatically selects
-      the highest-version `patchcore` AND highest-version `padim` exports so both models
-      run together in parallel.
+      the highest-version `patchcore`, `padim`, AND `efficient_ad` exports so all available
+      ensemble families run together in parallel.
     """
     exp_root = Path(exports_root)
     if not exp_root.is_dir():
@@ -164,26 +210,47 @@ def _get_shared_ov_core(cache_dir: str | Path | None = None) -> ov.Core:
         return _SHARED_OV_CORE
 
 
+def _is_intel_gpu(core: ov.Core, dev: str = "GPU") -> bool:
+    """Return True if OpenVINO `dev` is an Intel integrated/discrete GPU (Arc / Iris Xe / UHD)."""
+    base = dev.split(":")[-1].split(",")[0]
+    if base not in core.available_devices:
+        return False
+    try:
+        full_name = str(core.get_property(base, "FULL_DEVICE_NAME")).lower()
+        return any(tok in full_name for tok in ("intel", "arc", "iris", "uhd", "xe"))
+    except Exception:
+        return False
+
+
 def _prep_input_tensor(crop_rgb: np.ndarray) -> np.ndarray:
     """Convert `HxWx3` RGB image into contiguous `[1, 3, 256, 256]` float32 `[0, 1]` tensor."""
     if crop_rgb.shape[:2] != (256, 256):
         crop_rgb = cv2.resize(crop_rgb, (256, 256), interpolation=cv2.INTER_AREA)
-    return np.ascontiguousarray(OpenVINOInferencer.pre_process(crop_rgb), dtype=np.float32)
+    img = crop_rgb.astype(np.float32) if crop_rgb.dtype != np.float32 else crop_rgb.copy()
+    if img.max() > 1.0:
+        img /= 255.0
+    if img.ndim == 3:
+        img = np.expand_dims(img, axis=0)
+    if img.shape[-1] == 3:
+        img = img.transpose(0, 3, 1, 2)
+    return np.ascontiguousarray(img, dtype=np.float32)
 
 
 class SingleModelDetector:
-    """Wraps one exported OpenVINO model (`PatchCore` or `PaDiM`) with async C++ InferRequest support."""
+    """Wraps one exported OpenVINO model (`PatchCore`, `PaDiM`, or `EfficientAd`) with async C++ InferRequest."""
 
     def __init__(
         self,
         xml_path: str | Path,
         model_name: str,
-        preferred_device: str = "NPU",
+        preferred_device: str | None = "AUTO_INTEL",
         cache_dir: str | Path = "./anomaly/ov_cache",
         chroma_thresh: float = 18.0,
         dark_thresh: float = 35.0,
         min_defect_area_px: int = 6,
         cpu_threads: int | None = None,
+        rules: Mapping[str, Any] | None = None,
+        allow_non_intel_gpu: bool = False,
     ) -> None:
         self.xml_path = Path(xml_path)
         self.model_name = model_name
@@ -191,14 +258,33 @@ class SingleModelDetector:
         self.dark_thresh = dark_thresh
         self.min_defect_area_px = min_defect_area_px
 
+        resolved_pref, explicit_override = resolve_model_device(
+            model_name,
+            requested_device=preferred_device,
+            rules=rules,
+        )
+        self.preferred_device = resolved_pref
+        allow_any_gpu = bool(allow_non_intel_gpu or (explicit_override and "GPU" in resolved_pref.upper()))
+
         core = _get_shared_ov_core(cache_dir)
         ov_model = core.read_model(str(self.xml_path))
-        available = set(core.available_devices)
+        # Ensure static `[1, 3, 256, 256]` input tensor shape for Intel NPU & Arc iGPU compilation
+        pshape = ov_model.input(0).partial_shape
+        if pshape.is_dynamic:
+            target = [1, 3, 256, 256]
+            if len(pshape) == 4 and pshape[-1].is_static and pshape[-1].get_length() == 3:
+                target = [1, 256, 256, 3]
+            ov_model.reshape({ov_model.input(0): target})
 
-        candidates: list[str] = [preferred_device]
-        if preferred_device == "NPU":
-            candidates.extend(["HETERO:NPU,CPU", "GPU", "CPU"])
-        elif preferred_device != "CPU":
+        available = set(core.available_devices)
+        intel_gpu_ok = _is_intel_gpu(core, "GPU")
+
+        candidates: list[str] = [self.preferred_device]
+        if self.preferred_device == "NPU":
+            candidates.extend(["HETERO:NPU,GPU", "HETERO:NPU,CPU", "GPU", "CPU"])
+        elif self.preferred_device == "GPU":
+            candidates.extend(["HETERO:GPU,CPU", "CPU"])
+        elif self.preferred_device != "CPU":
             candidates.append("CPU")
 
         last_err: Exception | None = None
@@ -208,11 +294,20 @@ class SingleModelDetector:
         self._output_names: list[str] = []
 
         for dev in candidates:
-            base_dev = dev.split(":")[-1].split(",")[0]
-            if dev not in {"AUTO", "CPU"} and base_dev not in available:
+            sub_devs = [d.strip() for d in dev.split(":")[-1].split(",") if d.strip()]
+            if dev not in {"AUTO", "CPU"} and not all(sd in available for sd in sub_devs):
                 continue
+            if any(sd.startswith("GPU") for sd in sub_devs) and not (intel_gpu_ok or allow_any_gpu):
+                continue
+
             compile_cfg: dict[str, Any] = {}
-            if dev == "CPU":
+            if dev == "NPU" or dev.startswith("HETERO:NPU"):
+                compile_cfg["PERFORMANCE_HINT"] = "LATENCY"
+            elif dev.startswith("GPU") or dev.startswith("HETERO:GPU"):
+                compile_cfg["PERFORMANCE_HINT"] = "LATENCY"
+                compile_cfg["NUM_STREAMS"] = "1"
+                compile_cfg["INFERENCE_PRECISION_HINT"] = "f16"
+            elif dev == "CPU":
                 compile_cfg["PERFORMANCE_HINT"] = "LATENCY"
                 compile_cfg["NUM_STREAMS"] = "1"
                 if cpu_threads is not None and cpu_threads > 0:
@@ -237,7 +332,7 @@ class SingleModelDetector:
                 _ = self.finish_async(handle)
                 self.active_device = dev
                 break
-            except Exception as exc:  # pragma: no cover - NPU fallback guard
+            except Exception as exc:  # pragma: no cover - NPU/GPU fallback guard
                 last_err = exc
                 self.compiled_model = None
                 continue
@@ -341,6 +436,7 @@ class SingleModelDetector:
             "threshold": round(float(thresh_eff), 6),
             "verdict": verdict,
             "model": self.model_name,
+            "preferred_device": self.preferred_device,
             "device": self.active_device,
             "latency_ms": latency_ms,
             "color_deviation": color_check,
@@ -352,63 +448,61 @@ class SingleModelDetector:
         return out
 
 
+def required_majority_votes(num_models: int) -> int:
+    """Return number of `'defective'` votes required under the **2/3 majority rule** (`ceil(2*N/3)`)."""
+    if num_models <= 1:
+        return 1
+    return int(math.ceil((2 * int(num_models)) / 3.0))
+
+
 def fuse_ensemble_predictions(
     members: Sequence[Mapping[str, Any]],
-    color_check: Mapping[str, Any],
+    color_check: Mapping[str, Any] | None = None,
 ) -> tuple[float, BinaryVerdict]:
-    """Combine `PatchCore` + `PaDiM` single-threshold predictions into `'perfect'` or `'defective'`.
+    """Combine threshold-normalized ensemble predictions via **2/3 majority voting**.
 
-    - `PatchCore` (weight `0.65`) is the high-precision local nearest-neighbor primary detector.
-    - `PaDiM` (weight `0.35`) is the spatial Mahalanobis secondary detector.
-    - Returns `'defective'` when:
-      1. Both models flag `'defective'`, OR
-      2. Primary (`PatchCore`) flags `'defective'`, OR
-      3. Weighted normalized score `>= 1.0`, OR
-      4. Secondary (`PaDiM`) flags `'defective'` AND primary (`PatchCore`) also shows elevated score (`>= 0.75`).
-    - Otherwise returns `'perfect'` (preventing `PaDiM` clean-edge spikes or stud/number Lab blobs from
-      falsely rejecting clean bricks).
+    - Each model $i$ normalizes its raw score by its calibrated threshold:
+      `normalized_score_i = raw_score_i / threshold_i` (`>= 1.0` votes `"defective"`, `< 1.0` votes `"perfect"`).
+    - Required defective votes: `required_votes = ceil(len(members) * 2 / 3)` (i.e. **2 out of 3** models).
+    - The fused normalized score is the `required_votes`-th highest normalized score (the median when $N=3$),
+      so `fused_norm >= 1.0` if and only if at least `2/3` of the models vote `"defective"`.
     """
     _ = color_check
     if not members:
         return 1.0, "defective"
-    if len(members) == 1:
-        m0 = members[0]
-        ns0 = float(m0["normalized_score"])
-        v0: BinaryVerdict = "defective" if str(m0["verdict"]) == "defective" else "perfect"
-        return ns0, v0
 
-    raw_weights: list[float] = []
+    norms: list[float] = []
+    defective_votes = 0
     for m in members:
-        fam = _model_family(str(m.get("model", "")))
-        raw_weights.append(0.65 if fam in {"patchcore", "mh_patchcore"} else 0.35)
-    w_sum = sum(raw_weights) or 1.0
-    weights = [w / w_sum for w in raw_weights]
+        if "normalized_score" in m and m["normalized_score"] is not None:
+            ns = float(m["normalized_score"])
+        else:
+            ns = normalize_anomaly_score(
+                float(m.get("score", 0.0)),
+                float(m.get("threshold", 0.50)),
+            )
+        norms.append(ns)
+        verdict_str = str(m.get("verdict", "")).strip().lower()
+        is_def = (verdict_str == "defective") if verdict_str in {"perfect", "defective"} else (ns >= NORM_DEFECT_THRESHOLD)
+        if is_def:
+            defective_votes += 1
 
-    norms = [float(m["normalized_score"]) for m in members]
-    capped_norms = [min(s, 1.5) for s in norms]
-    verdicts = [str(m["verdict"]) for m in members]
-    weighted_norm = float(sum(w * s for w, s in zip(weights, capped_norms)))
+    if len(members) == 1:
+        v0: BinaryVerdict = "defective" if defective_votes >= 1 else "perfect"
+        s0 = max(norms[0], NORM_DEFECT_THRESHOLD) if v0 == "defective" else min(norms[0], 0.9999)
+        return s0, v0
 
-    primary_idx = next(
-        (i for i, m in enumerate(members) if _model_family(str(m.get("model", ""))) in {"patchcore", "mh_patchcore"}),
-        0,
-    )
-    primary_norm = norms[primary_idx]
-    primary_verdict = verdicts[primary_idx]
-    num_defective = sum(1 for v in verdicts if v == "defective")
+    req_votes = required_majority_votes(len(members))
+    norms_desc = sorted(norms, reverse=True)
+    order_stat_score = float(norms_desc[req_votes - 1])
 
-    if num_defective >= 2 or primary_verdict == "defective" or weighted_norm >= NORM_DEFECT_THRESHOLD:
-        def_max = max((s for s, v in zip(norms, verdicts) if v == "defective"), default=weighted_norm)
-        return max(weighted_norm, def_max, NORM_DEFECT_THRESHOLD), "defective"
-
-    if num_defective == 1 and primary_norm >= 0.75:
-        return max(weighted_norm, NORM_DEFECT_THRESHOLD), "defective"
-
-    return min(weighted_norm, 0.9999), "perfect"
+    if defective_votes >= req_votes:
+        return max(order_stat_score, NORM_DEFECT_THRESHOLD), "defective"
+    return min(order_stat_score, 0.9999), "perfect"
 
 
 class EnsembleAnomalyDetector:
-    """Runs `PatchCore` + `PaDiM` IN PARALLEL on the single camera crop and returns `'perfect'` or `'defective'`."""
+    """Runs `PatchCore` (GPU) + `PaDiM` (GPU) + `EfficientAd` (NPU) IN PARALLEL with 2/3 majority voting."""
 
     def __init__(
         self,
@@ -422,6 +516,8 @@ class EnsembleAnomalyDetector:
         self.model_name = "+".join(d.model_name for d in self.detectors)
         devices = sorted({d.active_device for d in self.detectors})
         self.active_device = "+".join(devices)
+        pref_devices = sorted({d.preferred_device for d in self.detectors})
+        self.preferred_device = "+".join(pref_devices)
         self.calib_cache: dict[str, float | None] = {
             d.model_name: load_export_calibration(self.exports_root / d.model_name)
             for d in self.detectors
@@ -451,7 +547,7 @@ class EnsembleAnomalyDetector:
         include_heatmap_b64: bool = False,
         model_thresholds: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run all ensemble models (`PatchCore` + `PaDiM`) concurrently on `crop_rgb`."""
+        """Run all ensemble models (`PatchCore` + `PaDiM` + `EfficientAd`) concurrently on `crop_rgb`."""
         if len(self.detectors) == 1:
             d0 = self.detectors[0]
             t0_thresh = self._resolve_member_threshold(d0.model_name, threshold, model_thresholds)
@@ -462,11 +558,19 @@ class EnsembleAnomalyDetector:
                 return_map=return_map,
                 include_heatmap_b64=include_heatmap_b64,
             )
+            def_votes = 1 if single["verdict"] == "defective" else 0
             single["parallel_execution"] = False
             single["ensemble_size"] = 1
+            single["votes"] = {
+                "defective": def_votes,
+                "perfect": 1 - def_votes,
+                "required_for_defective": 1,
+                "rule": "2/3_majority",
+            }
             single["ensemble_members"] = [
                 {
                     "model": d0.model_name,
+                    "preferred_device": d0.preferred_device,
                     "device": d0.active_device,
                     "score": single["score"],
                     "normalized_score": single["normalized_score"],
@@ -482,9 +586,9 @@ class EnsembleAnomalyDetector:
 
         # 1. Pre-normalize `[1, 3, 256, 256]` float32 tensor ONCE for all models.
         inp_tensor = _prep_input_tensor(crop_rgb)
-        # 2. Kick off ALL OpenVINO models (`PatchCore` + `PaDiM`) simultaneously in C++ (`start_async`).
+        # 2. Kick off ALL OpenVINO models simultaneously in C++ (`EfficientAd` on NPU + `PatchCore`/`PaDiM` on GPU).
         async_handles = [det.start_async_tensor(inp_tensor) for det in self.detectors]
-        # 3. Run Lab `compute_color_deviation` concurrently in Python while OpenVINO executes in C++.
+        # 3. Run Lab `compute_color_deviation` concurrently in Python while OpenVINO executes on NPU + GPU.
         color_check = compute_color_deviation(
             crop_rgb,
             mask_u8=mask_u8,
@@ -497,15 +601,19 @@ class EnsembleAnomalyDetector:
 
         members_info: list[dict[str, Any]] = []
         norm_maps: list[tuple[float, np.ndarray]] = []
+        def_votes = 0
 
         for det, (raw_s, amap_i, mlat) in zip(self.detectors, raw_results):
             thresh_i = self._resolve_member_threshold(det.model_name, threshold, model_thresholds)
             ns_i = normalize_anomaly_score(raw_s, thresh_i)
-            v_i: BinaryVerdict = "defective" if raw_s >= thresh_i else "perfect"
+            v_i: BinaryVerdict = "defective" if ns_i >= NORM_DEFECT_THRESHOLD else "perfect"
+            if v_i == "defective":
+                def_votes += 1
 
             members_info.append(
                 {
                     "model": det.model_name,
+                    "preferred_device": det.preferred_device,
                     "device": det.active_device,
                     "score": round(float(raw_s), 4),
                     "normalized_score": round(float(ns_i), 4),
@@ -514,12 +622,23 @@ class EnsembleAnomalyDetector:
                     "latency_ms": mlat,
                 }
             )
-            w_i = 0.65 if _model_family(det.model_name) in {"patchcore", "mh_patchcore"} else 0.35
             if return_map or include_heatmap_b64:
-                lo_m, hi_m = float(np.min(amap_i)), float(np.max(amap_i))
-                scaled_m = (amap_i - lo_m) / (hi_m - lo_m) if (hi_m - lo_m) > 1e-6 else np.clip(amap_i, 0.0, 1.0)
+                amap_resized = (
+                    cv2.resize(amap_i, (256, 256), interpolation=cv2.INTER_LINEAR)
+                    if amap_i.shape[:2] != (256, 256)
+                    else amap_i
+                )
+                lo_m, hi_m = float(np.min(amap_resized)), float(np.max(amap_resized))
+                scaled_m = (
+                    (amap_resized - lo_m) / (hi_m - lo_m)
+                    if (hi_m - lo_m) > 1e-6
+                    else np.clip(amap_resized, 0.0, 1.0)
+                )
+                # Equal-vote visual weighting scaled slightly by normalized anomaly response
+                w_i = max(0.25, min(float(ns_i), 2.0))
                 norm_maps.append((w_i, scaled_m.astype(np.float32)))
 
+        req_votes = required_majority_votes(len(members_info))
         fused_norm, fused_verdict = fuse_ensemble_predictions(members_info, color_check)
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -530,9 +649,16 @@ class EnsembleAnomalyDetector:
             "threshold": NORM_DEFECT_THRESHOLD,
             "verdict": fused_verdict,
             "model": self.model_name,
+            "preferred_device": self.preferred_device,
             "device": self.active_device,
             "parallel_execution": True,
             "ensemble_size": len(self.detectors),
+            "votes": {
+                "defective": def_votes,
+                "perfect": len(members_info) - def_votes,
+                "required_for_defective": req_votes,
+                "rule": "2/3_majority",
+            },
             "ensemble_members": members_info,
             "latency_ms": latency_ms,
             "color_deviation": color_check,
@@ -573,7 +699,6 @@ class BrickAnomalyEvaluator:
         )
 
         rules = load_rules(self.rules_path)
-        preferred_device = device or str(rules.get("anomaly_device", "CPU"))
         mcfg = load_model_config(defect_cfg_path)
 
         names = discover_exports(self.exports_root, requested=export_spec, enable_ensemble=enable_ensemble)
@@ -585,12 +710,13 @@ class BrickAnomalyEvaluator:
             SingleModelDetector(
                 xml_path=self.exports_root / name / "weights" / "openvino" / "model.xml",
                 model_name=name,
-                preferred_device=preferred_device,
+                preferred_device=device,
                 cache_dir=cache_dir,
                 chroma_thresh=mcfg.color_dev_chroma_thresh,
                 dark_thresh=mcfg.color_dev_dark_thresh,
                 min_defect_area_px=mcfg.min_defect_area_px,
                 cpu_threads=cpu_threads,
+                rules=rules,
             )
             for name in names
         ]

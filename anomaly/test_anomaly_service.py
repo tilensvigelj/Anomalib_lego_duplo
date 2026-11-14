@@ -13,15 +13,19 @@ import cv2
 import numpy as np
 import zmq
 
+from anomaly.config import normalize_model_type
 from anomaly.detector import (
-    BrickAnomalyEvaluator,
+    ENSEMBLE_FAMILIES,
     NORM_DEFECT_THRESHOLD,
     discover_exports,
     fuse_ensemble_predictions,
     normalize_anomaly_score,
+    required_majority_votes,
+    resolve_model_device,
 )
 from anomaly.evaluate import main as evaluate_cli_main
 from anomaly.service import AnomalyZMQService
+from anomaly.train import _ensure_efficientad_ood_dir
 
 
 def _encode_rgb_b64(rgb: np.ndarray) -> str:
@@ -37,7 +41,7 @@ def _encode_rgb_png_bytes(rgb: np.ndarray) -> bytes:
 
 
 class TestSingleThresholdAndBinaryEnsemble(unittest.TestCase):
-    """Verify single-threshold normalization and binary `'perfect'` / `'defective'` fusion."""
+    """Verify threshold normalization, Intel NPU/GPU routing, and 2/3 majority voting."""
 
     def test_single_threshold_normalization(self) -> None:
         # Threshold = 0.025 -> raw 0.025 maps to 1.0 ('defective')
@@ -46,64 +50,98 @@ class TestSingleThresholdAndBinaryEnsemble(unittest.TestCase):
         self.assertAlmostEqual(normalize_anomaly_score(0.025, 0.025), NORM_DEFECT_THRESHOLD, places=5)
         self.assertGreater(normalize_anomaly_score(0.040, 0.025), NORM_DEFECT_THRESHOLD)
 
-        # Heterogeneous thresholds map onto identical 1.0 boundary
-        s_pc = normalize_anomaly_score(0.02628, 0.02628)
-        s_pd = normalize_anomaly_score(0.11664, 0.11664)
+        # Heterogeneous thresholds across PatchCore, PaDiM, and EfficientAd map onto identical 1.0 boundary
+        s_pc = normalize_anomaly_score(0.1574, 0.1574)
+        s_pd = normalize_anomaly_score(0.0508, 0.0508)
+        s_ea = normalize_anomaly_score(0.4200, 0.4200)
         self.assertAlmostEqual(s_pc, 1.0, places=5)
         self.assertAlmostEqual(s_pd, 1.0, places=5)
+        self.assertAlmostEqual(s_ea, 1.0, places=5)
 
-    def test_binary_ensemble_fusion_rules(self) -> None:
-        # 1. Both models below threshold -> 'perfect'
-        s_clean, v_clean = fuse_ensemble_predictions(
-            [
-                {"model": "patchcore_mat_v4", "normalized_score": 0.45, "verdict": "perfect"},
-                {"model": "padim_mat_v3", "normalized_score": 0.60, "verdict": "perfect"},
-            ],
-            color_check={"flagged": False},
-        )
-        self.assertEqual(v_clean, "perfect")
-        self.assertLess(s_clean, 1.0)
+    def test_intel_npu_and_gpu_device_routing_and_discovery(self) -> None:
+        self.assertEqual(ENSEMBLE_FAMILIES, ("patchcore", "padim", "efficient_ad"))
+        self.assertEqual(normalize_model_type("efficientaid"), "efficient_ad")
+        self.assertEqual(normalize_model_type("efficientad"), "efficient_ad")
 
-        # 2. PatchCore (primary) >= threshold -> immediately 'defective'
-        s_pc_def, v_pc_def = fuse_ensemble_predictions(
-            [
-                {"model": "patchcore_mat_v4", "normalized_score": 1.15, "verdict": "defective"},
-                {"model": "padim_mat_v3", "normalized_score": 0.50, "verdict": "perfect"},
-            ],
-            color_check={"flagged": False},
-        )
-        self.assertEqual(v_pc_def, "defective")
-        self.assertGreaterEqual(s_pc_def, 1.0)
+        # Default AUTO_INTEL routes EfficientAd -> NPU, PatchCore -> GPU, PaDiM -> GPU
+        dev_ea, exp_ea = resolve_model_device("efficient_ad_mat_v1")
+        dev_ea_alias, _ = resolve_model_device("efficientaid_mat_v2")
+        dev_pc, exp_pc = resolve_model_device("patchcore_mat_v1")
+        dev_pd, exp_pd = resolve_model_device("padim_mat_v1")
+        self.assertEqual((dev_ea, exp_ea), ("NPU", False))
+        self.assertEqual(dev_ea_alias, "NPU")
+        self.assertEqual((dev_pc, exp_pc), ("GPU", False))
+        self.assertEqual((dev_pd, exp_pd), ("GPU", False))
 
-        # 3. PaDiM noisy edge spike alone while PatchCore is low -> stays 'perfect' (even if stud triggers color blob)
-        s_pd_noise, v_pd_noise = fuse_ensemble_predictions(
-            [
-                {"model": "patchcore_mat_v4", "normalized_score": 0.30, "verdict": "perfect"},
-                {"model": "padim_mat_v3", "normalized_score": 1.10, "verdict": "defective"},
-            ],
-            color_check={"flagged": True},
-        )
-        self.assertEqual(v_pd_noise, "perfect")
-        self.assertLess(s_pd_noise, 1.0)
+        # Explicit CLI override forces chosen device
+        dev_override, is_exp = resolve_model_device("efficient_ad_mat_v1", requested_device="CPU")
+        self.assertEqual((dev_override, is_exp), ("CPU", True))
 
-        # 4. PaDiM >= threshold corroborated by elevated PatchCore (>= 0.75) OR weighted_norm >= 1.0 -> 'defective'
-        _, v_pd_corrob1 = fuse_ensemble_predictions(
-            [
-                {"model": "patchcore_mat_v4", "normalized_score": 0.80, "verdict": "perfect"},
-                {"model": "padim_mat_v3", "normalized_score": 1.12, "verdict": "defective"},
-            ],
-            color_check={"flagged": False},
-        )
-        self.assertEqual(v_pd_corrob1, "defective")
+        # Auto-discovery picks latest version of all 3 families (PatchCore + PaDiM + EfficientAd)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("patchcore_mat_v1", "patchcore_mat_v2", "padim_mat_v1", "efficient_ad_mat_v1"):
+                xml_p = root / name / "weights" / "openvino" / "model.xml"
+                xml_p.parent.mkdir(parents=True, exist_ok=True)
+                xml_p.write_text("<net/>", encoding="utf-8")
+            found = discover_exports(root, requested="auto", enable_ensemble=True)
+            self.assertEqual(found, ["patchcore_mat_v2", "padim_mat_v1", "efficient_ad_mat_v1"])
 
-        _, v_pd_corrob2 = fuse_ensemble_predictions(
+            ood_dir = _ensure_efficientad_ood_dir(ood_root=root / "ood_pen", num_images=8)
+            self.assertEqual(len(list((ood_dir / "ood").glob("*.png"))), 8)
+
+    def test_two_thirds_majority_voting_across_three_models(self) -> None:
+        self.assertEqual(required_majority_votes(3), 2)
+        self.assertEqual(required_majority_votes(2), 2)
+        self.assertEqual(required_majority_votes(1), 1)
+
+        # 1. 0/3 votes -> 'perfect'
+        s_0, v_0 = fuse_ensemble_predictions(
             [
-                {"model": "patchcore_mat_v4", "normalized_score": 0.74, "verdict": "perfect"},
-                {"model": "padim_mat_v3", "normalized_score": 1.70, "verdict": "defective"},
-            ],
-            color_check={"flagged": False},
+                {"model": "patchcore_mat_v1", "score": 0.08, "threshold": 0.16},     # norm = 0.50 (perfect)
+                {"model": "padim_mat_v1", "score": 0.03, "threshold": 0.05},         # norm = 0.60 (perfect)
+                {"model": "efficient_ad_mat_v1", "score": 0.18, "threshold": 0.40},  # norm = 0.45 (perfect)
+            ]
         )
-        self.assertEqual(v_pd_corrob2, "defective")
+        self.assertEqual(v_0, "perfect")
+        self.assertAlmostEqual(s_0, 0.50, places=4)
+
+        # 2. 1/3 votes (only 1 model spikes >= threshold) -> 'perfect' regardless of which single model spikes!
+        for spike_idx in range(3):
+            members = [
+                {"model": "patchcore_mat_v1", "normalized_score": 0.55, "verdict": "perfect"},
+                {"model": "padim_mat_v1", "normalized_score": 0.72, "verdict": "perfect"},
+                {"model": "efficient_ad_mat_v1", "normalized_score": 0.61, "verdict": "perfect"},
+            ]
+            members[spike_idx]["normalized_score"] = 1.85
+            members[spike_idx]["verdict"] = "defective"
+            s_1, v_1 = fuse_ensemble_predictions(members)
+            self.assertEqual(v_1, "perfect", msg=f"1/3 spike on idx={spike_idx} must stay 'perfect'")
+            self.assertLess(s_1, 1.0)
+
+        # 3. 2/3 votes (any 2 of the 3 models >= threshold) -> 'defective'
+        for clean_idx in range(3):
+            members = [
+                {"model": "patchcore_mat_v1", "normalized_score": 1.35, "verdict": "defective"},
+                {"model": "padim_mat_v1", "normalized_score": 1.15, "verdict": "defective"},
+                {"model": "efficient_ad_mat_v1", "normalized_score": 1.60, "verdict": "defective"},
+            ]
+            members[clean_idx]["normalized_score"] = 0.40
+            members[clean_idx]["verdict"] = "perfect"
+            s_2, v_2 = fuse_ensemble_predictions(members)
+            self.assertEqual(v_2, "defective", msg=f"2/3 votes with clean idx={clean_idx} must be 'defective'")
+            self.assertGreaterEqual(s_2, 1.0)
+
+        # 4. 3/3 votes -> 'defective'
+        s_3, v_3 = fuse_ensemble_predictions(
+            [
+                {"model": "patchcore_mat_v1", "normalized_score": 2.10, "verdict": "defective"},
+                {"model": "padim_mat_v1", "normalized_score": 1.40, "verdict": "defective"},
+                {"model": "efficient_ad_mat_v1", "normalized_score": 1.75, "verdict": "defective"},
+            ]
+        )
+        self.assertEqual(v_3, "defective")
+        self.assertAlmostEqual(s_3, 1.75, places=4)
 
 
 class TestLiveSingleCameraService(unittest.TestCase):
@@ -132,6 +170,8 @@ class TestLiveSingleCameraService(unittest.TestCase):
         exports = discover_exports("anomaly/exports", requested="auto", enable_ensemble=True)
         res = self.service.evaluator.evaluate(self.clean_rgb)
         self.assertIn(res["verdict"], {"perfect", "defective"})
+        self.assertIn("votes", res)
+        self.assertEqual(res["votes"]["rule"], "2/3_majority")
         if len(exports) >= 2:
             self.assertEqual(res["ensemble_size"], len(exports))
             self.assertTrue(res["parallel_execution"])

@@ -15,7 +15,7 @@ from anomalib.engine import Engine
 from anomalib.models import EfficientAd, FoundAD, MHPatchcore, Padim, Patchcore
 import openvino as ov
 
-from .config import load_model_config
+from .config import load_model_config, normalize_model_type
 from .data import build_datamodule
 
 MODEL_CLASSES = {
@@ -25,6 +25,7 @@ MODEL_CLASSES = {
     "found_ad": FoundAD,
     "efficient_ad": EfficientAd,
 }
+CLI_MODEL_CHOICES = tuple(MODEL_CLASSES) + ("efficientad", "efficientaid")
 
 COMPRESSION_MAP = {
     "fp16": CompressionType.FP16,
@@ -76,7 +77,7 @@ def export_model(
     overwrite: bool = False,
 ) -> Path:
     mcfg = load_model_config(config_path)
-    chosen_model = model_type or mcfg.model_type
+    chosen_model = normalize_model_type(model_type or mcfg.model_type)
     ver = int(version if version is not None else mcfg.version)
     run_name = f"{chosen_model}_mat_v{ver}"
     suffix = "" if precision == "fp16" else f"_{precision}"
@@ -122,7 +123,7 @@ def export_model(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Export trained Anomalib model to OpenVINO IR.")
-    parser.add_argument("--model", default=None, choices=tuple(MODEL_CLASSES))
+    parser.add_argument("--model", default=None, choices=CLI_MODEL_CHOICES)
     parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--precision", default="fp16", choices=tuple(COMPRESSION_MAP))
     parser.add_argument("--ckpt", default=None)
