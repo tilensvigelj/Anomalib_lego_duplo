@@ -84,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calibration-dir", default="./data/calibration")
     parser.add_argument("--device", default=None)
     parser.add_argument("--force-crop", action="store_true")
+    parser.add_argument("--no-yolo", action="store_true", help="Disable Roboflow 'duplo-model/1' YOLO ROI gating.")
     parser.add_argument("--verdict-only", action="store_true", help="Print ONLY 'perfect' or 'defective'.")
     parser.add_argument("--save-vis", default=None, help="Optional path to save visual inspection PNG.")
     args = parser.parse_args(argv)
@@ -102,6 +103,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         enable_ensemble=not args.single_model,
     )
+    if args.no_yolo:
+        from dataclasses import replace
+
+        evaluator.prep_cfg = replace(evaluator.prep_cfg, USE_YOLO=False)
 
     need_vis = bool(args.save_vis)
     res = evaluator.evaluate(

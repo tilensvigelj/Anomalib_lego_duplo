@@ -61,23 +61,46 @@ def _score_folder(
 
 
 def calibrate_single_threshold(good_scores: Sequence[float], defect_scores: Sequence[float]) -> tuple[float, float, float | None]:
-    """Compute optimal single `threshold` separating `good` from positive `defect` scores."""
-    pos_defects = [float(d) for d in defect_scores if float(d) > 1e-5]
-    if pos_defects:
-        min_def = float(np.min(pos_defects))
-        good_below = [g for g in good_scores if g < min_def]
-        if good_below:
-            rec_thresh = 0.5 * (float(max(good_below)) + min_def)
-        else:
-            rec_thresh = max(min_def * 0.98, 1e-4)
+    """Compute optimal single `threshold` maximizing balanced accuracy (Youden's J = TPR - FPR).
 
-        fpr_at_thresh = (
-            float(sum(1 for g in good_scores if g >= rec_thresh)) / len(good_scores)
-            if good_scores
-            else 0.0
-        )
-        thresh_5fpr = float(np.percentile(good_scores, 95)) if good_scores else rec_thresh
-        recall_5fpr = float(sum(1 for d in defect_scores if d >= thresh_5fpr)) / len(defect_scores)
+    Robust against single mislabeled or hidden-side outliers in `test/defect` (which previously
+    pulled `min(defect_scores)` below most `good` bricks and caused >70% false-defective rate).
+    """
+    pos_defects = [float(d) for d in defect_scores if float(d) > 1e-5]
+    if pos_defects and good_scores:
+        g_arr = np.sort(np.asarray(good_scores, dtype=np.float64))
+        d_arr = np.sort(np.asarray(pos_defects, dtype=np.float64))
+
+        # If classes are cleanly separable with <= 10% FPR, keep clean midpoint; otherwise maximize Youden's J
+        min_def = float(d_arr[0])
+        fpr_at_min_def = float(np.mean(g_arr >= min_def))
+        if fpr_at_min_def <= 0.10:
+            good_below = g_arr[g_arr < min_def]
+            rec_thresh = 0.5 * (float(good_below[-1]) + min_def) if good_below.size > 0 else max(min_def * 0.98, 1e-4)
+        else:
+            all_vals = np.unique(np.concatenate([g_arr, d_arr]))
+            if all_vals.size >= 2:
+                mids = 0.5 * (all_vals[:-1] + all_vals[1:])
+                candidates = np.concatenate([[all_vals[0] * 0.98], mids, [min(all_vals[-1] * 1.02, 1.05)]])
+            else:
+                candidates = all_vals
+
+            best_obj = -1e9
+            rec_thresh = float(np.percentile(g_arr, 90))
+            for cand in candidates:
+                tpr = float(np.mean(d_arr >= cand))
+                tnr = float(np.mean(g_arr < cand))
+                # Maximize balanced accuracy 0.5*(TPR + TNR), penalizing >20% false-positive rate on clean bricks
+                fpr = 1.0 - tnr
+                penalty = 0.35 * max(0.0, fpr - 0.20)
+                obj = 0.5 * (tpr + tnr) - penalty
+                if obj > best_obj:
+                    best_obj = obj
+                    rec_thresh = float(cand)
+
+        fpr_at_thresh = float(np.mean(g_arr >= rec_thresh))
+        thresh_5fpr = float(np.percentile(g_arr, 95))
+        recall_5fpr = float(np.mean(np.asarray(defect_scores, dtype=np.float64) >= thresh_5fpr))
         return round(float(rec_thresh), 6), round(fpr_at_thresh, 4), round(recall_5fpr, 4)
 
     g_max = float(np.max(good_scores))

@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 
 # Nastavitve map
-INPUT_FOLDER = "./data/processed/mat/test/good"
+INPUT_FOLDER = "./data/processed/mat/train/good"
 OUTPUT_FOLDER = "./data/processed/mat/test/good"
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
 

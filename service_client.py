@@ -33,7 +33,7 @@ def send_random_image(folder_path, server_address="tcp://127.0.0.1:5555"):
     return message
 
 if __name__ == "__main__":
-    folder = "D:\\junction2026\\mat"
+    folder = "C:/Users/tilen/Desktop/JUNCTION/physicalai_env/data/processed/mat/test/defect"
     if not os.path.exists(folder):
         os.makedirs(folder)
         print(f"Ustvarjena testna mapa '{folder}'. Prosim vanjo dodajte nekaj PNG slik.")

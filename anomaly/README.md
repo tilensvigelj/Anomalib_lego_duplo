@@ -17,7 +17,7 @@ python -m anomaly.export --model efficient_ad --version 1 --precision fp16
 python -m anomaly.verify --device AUTO_INTEL --update-rules
 
 # 4. Test a single image from CLI
-python -m anomaly.evaluate --image data/processed/mat/test/good/sample.png --verdict-only
+python -m anomaly.evaluate --image data/processed/mat/test/good/realsense_rgb_20261114_105604_250.png --verdict-only
 
 # 5. Start ZeroMQ REP service (replies strictly "perfect" or "defective")
 python -m anomaly.service

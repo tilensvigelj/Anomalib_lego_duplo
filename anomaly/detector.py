@@ -747,19 +747,22 @@ class BrickAnomalyEvaluator:
         force_crop: bool = False,
         rules: Mapping[str, Any] | None = None,
         include_arrays: bool = False,
+        yolo_box: Sequence[int] | None = None,
     ) -> dict[str, Any]:
-        """Preprocess (if full camera frame) and classify brick as `'perfect'` or `'defective'`."""
+        """Preprocess (if full camera frame, searching strictly inside YOLO box) and classify brick."""
         active_rules = dict(rules) if rules is not None else load_rules(self.rules_path)
         default_thresh = parse_threshold_value(active_rules.get("threshold", 0.50), default=0.50)
 
-        needs_crop = bool(force_crop) or (
-            color_rgb.shape[:2] != (self.prep_cfg.OUT_SIZE, self.prep_cfg.OUT_SIZE)
+        needs_crop = (
+            bool(force_crop)
+            or (yolo_box is not None)
+            or (color_rgb.shape[:2] != (self.prep_cfg.OUT_SIZE, self.prep_cfg.OUT_SIZE))
         )
         crop_rgb = color_rgb
         if needs_crop:
             t_prep = time.perf_counter()
             rt_cfg = replace(self.prep_cfg, MAKE_DEBUG_OVERLAY=bool(include_arrays))
-            crop_rgb, mask_u8, info = preprocess(color_rgb, self.bg_rgb, rt_cfg)
+            crop_rgb, mask_u8, info = preprocess(color_rgb, self.bg_rgb, rt_cfg, yolo_box=yolo_box)
             prep_ms = round((time.perf_counter() - t_prep) * 1000.0, 2)
             if not info["valid"]:
                 out_fail: dict[str, Any] = {
@@ -773,6 +776,9 @@ class BrickAnomalyEvaluator:
                     "latency_ms": prep_ms,
                     "preprocess_ms": prep_ms,
                     "reason": str(info["reason"]),
+                    "yolo_used": bool(info.get("yolo_used", False)),
+                    "yolo_box": info.get("yolo_box"),
+                    "yolo_confidence": info.get("yolo_confidence"),
                 }
                 if include_arrays:
                     out_fail["crop_rgb"] = crop_rgb
@@ -783,7 +789,7 @@ class BrickAnomalyEvaluator:
                 return out_fail
         else:
             prep_ms = 0.0
-            info = {"debug_overlay": None}
+            info = {"debug_overlay": None, "yolo_used": False, "yolo_box": None, "yolo_confidence": None}
 
         res = self.detector.score_crop(
             crop_rgb=crop_rgb,
@@ -796,6 +802,10 @@ class BrickAnomalyEvaluator:
         amap = res.pop("anomaly_map", None)
         res["preprocess_ms"] = prep_ms
         res["latency_ms"] = round(float(res["latency_ms"]) + prep_ms, 2)
+        res["yolo_used"] = bool(info.get("yolo_used", False))
+        if info.get("yolo_box") is not None:
+            res["yolo_box"] = info.get("yolo_box")
+            res["yolo_confidence"] = info.get("yolo_confidence")
         if include_arrays:
             res["crop_rgb"] = crop_rgb
             res["anomaly_map"] = amap
@@ -807,7 +817,14 @@ class BrickAnomalyEvaluator:
         color_rgb: np.ndarray,
         mask_u8: np.ndarray | None = None,
         force_crop: bool = False,
+        yolo_box: Sequence[int] | None = None,
     ) -> BinaryVerdict:
         """Return strictly `'perfect'` or `'defective'`."""
-        res = self.evaluate(color_rgb=color_rgb, mask_u8=mask_u8, force_crop=force_crop, include_arrays=False)
+        res = self.evaluate(
+            color_rgb=color_rgb,
+            mask_u8=mask_u8,
+            force_crop=force_crop,
+            include_arrays=False,
+            yolo_box=yolo_box,
+        )
         return "defective" if res["verdict"] == "defective" else "perfect"

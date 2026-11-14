@@ -47,6 +47,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Allow masks that touch the image border (useful for tight close-up crops).",
     )
+    parser.add_argument(
+        "--no-yolo",
+        action="store_true",
+        help="Disable Roboflow 'duplo-model/1' YOLO ROI gating.",
+    )
+    parser.add_argument(
+        "--require-yolo",
+        action="store_true",
+        help="Fail immediately if ROBOFLOW_API_KEY is not set.",
+    )
+    parser.add_argument(
+        "--yolo-model",
+        default=None,
+        help="Override Roboflow model ID (default from config: duplo-model/1).",
+    )
+    parser.add_argument(
+        "--yolo-confidence",
+        type=float,
+        default=None,
+        help="Override YOLO minimum confidence threshold (default: 0.25).",
+    )
     args = parser.parse_args(argv)
 
     cfg = (
@@ -58,6 +79,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         cfg = replace(cfg, CANONICALIZE_ROTATION=False)
     if args.allow_border_touch:
         cfg = replace(cfg, REJECT_BORDER_TOUCH=False)
+    if args.no_yolo:
+        cfg = replace(cfg, USE_YOLO=False)
+    if args.require_yolo:
+        cfg = replace(cfg, USE_YOLO=True, YOLO_STRICT=True)
+    if args.yolo_model:
+        cfg = replace(cfg, YOLO_MODEL_ID=str(args.yolo_model))
+    if args.yolo_confidence is not None:
+        cfg = replace(cfg, YOLO_CONFIDENCE=float(args.yolo_confidence))
 
     raw_dir = Path(args.raw_dir)
     out_dir = Path(args.out_dir)

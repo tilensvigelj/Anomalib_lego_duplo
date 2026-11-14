@@ -82,19 +82,23 @@ class AnomalyZMQService:
 
     def _parse_payload(
         self, payload: bytes | str | Mapping[str, Any]
-    ) -> tuple[np.ndarray | None, np.ndarray | None, bool]:
-        """Parse JSON dict, base64 string, or raw PNG/JPEG bytes into `(color_rgb, mask_u8, force_crop)`."""
+    ) -> tuple[np.ndarray | None, np.ndarray | None, bool, tuple[int, int, int, int] | None]:
+        """Parse JSON dict, base64 string, or raw PNG/JPEG bytes into `(color_rgb, mask_u8, force_crop, yolo_box)`."""
         if isinstance(payload, Mapping):
             b64_img = str(payload.get("image") or payload.get("frame") or "")
             bgr = _decode_png_b64(b64_img, cv2.IMREAD_COLOR)
             if bgr is None:
-                return None, None, False
+                return None, None, False, None
             mask_u8 = (
                 _decode_png_b64(str(payload["mask"]), cv2.IMREAD_GRAYSCALE)
                 if payload.get("mask")
                 else None
             )
-            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), mask_u8, bool(payload.get("crop", False))
+            raw_box = payload.get("yolo_box")
+            ybox: tuple[int, int, int, int] | None = None
+            if isinstance(raw_box, Sequence) and not isinstance(raw_box, (str, bytes)) and len(raw_box) == 4:
+                ybox = (int(raw_box[0]), int(raw_box[1]), int(raw_box[2]), int(raw_box[3]))
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), mask_u8, bool(payload.get("crop", False)), ybox
 
         if isinstance(payload, bytes):
             stripped = payload.lstrip()
@@ -102,29 +106,29 @@ class AnomalyZMQService:
                 req = json.loads(stripped.decode("utf-8"))
                 if isinstance(req, Mapping):
                     return self._parse_payload(req)
-                return None, None, False
+                return None, None, False, None
             bgr_raw = _decode_raw_bytes(payload, cv2.IMREAD_COLOR)
             if bgr_raw is not None:
-                return cv2.cvtColor(bgr_raw, cv2.COLOR_BGR2RGB), None, False
+                return cv2.cvtColor(bgr_raw, cv2.COLOR_BGR2RGB), None, False, None
             return self._parse_payload(payload.decode("utf-8", errors="ignore"))
 
         text = str(payload).strip()
         if not text:
-            return None, None, False
+            return None, None, False, None
         if text.startswith("{"):
             req = json.loads(text)
             if isinstance(req, Mapping):
                 return self._parse_payload(req)
-            return None, None, False
+            return None, None, False, None
         bgr = _decode_png_b64(text, cv2.IMREAD_COLOR)
         if bgr is None:
-            return None, None, False
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), None, False
+            return None, None, False, None
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), None, False, None
 
     def handle_request(self, payload: bytes | str | Mapping[str, Any]) -> BinaryVerdict:
         """Evaluate incoming camera image (raw full frame or 256x256 crop) -> `'perfect'` | `'defective'`."""
         try:
-            color_rgb, mask_u8, force_crop = self._parse_payload(payload)
+            color_rgb, mask_u8, force_crop, yolo_box = self._parse_payload(payload)
         except Exception:
             logger.exception("Failed to decode request payload")
             return "defective"
@@ -132,7 +136,12 @@ class AnomalyZMQService:
         if color_rgb is None:
             return "defective"
 
-        return self.evaluator.classify(color_rgb=color_rgb, mask_u8=mask_u8, force_crop=force_crop)
+        return self.evaluator.classify(
+            color_rgb=color_rgb,
+            mask_u8=mask_u8,
+            force_crop=force_crop,
+            yolo_box=yolo_box,
+        )
 
     def serve_forever(
         self,

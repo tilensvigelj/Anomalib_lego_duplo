@@ -14,6 +14,7 @@ anomalib-env/
 # Secrets & tokens (NEVER commit tokens!)
 .env
 .env.*
+!.env.example
 *token*
 *secret*
 *.pem

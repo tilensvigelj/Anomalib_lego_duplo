@@ -135,7 +135,7 @@ def create_model(
         return EfficientAd(
             imagenet_dir=ood_path,
             teacher_out_channels=384,
-            model_size="s",
+            model_size="small",
             padding=True,
             post_processor=post_processor,
         )

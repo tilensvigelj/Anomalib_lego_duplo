@@ -16,6 +16,7 @@ dependencies = [
     "scipy>=1.12.0",
     "pyzmq>=26.0.0",
     "pyyaml>=6.0.0",
+    "inference-sdk>=1.5.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -24,6 +25,7 @@ include = ["perception*", "anomaly*"]
 
 [project.scripts]
 j26-preprocess = "perception.preprocess:main"
+j26-yolo = "perception.yolo_duplo:main"
 j26-capture = "perception.capture_realsense:main"
 j26-hue-aug = "perception.augment_hue:main"
 j26-train = "anomaly.train:main"

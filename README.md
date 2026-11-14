@@ -41,9 +41,15 @@ j26/
    - `data/raw/mat/test/good/` (held-out clean bricks)
    - `data/raw/mat/test/defect/` (bricks with marker marks)
 
-### Step 2: Subtract Background, Remove Specular Glare & Crop to `256x256` (`data/processed/mat/`)
-```bash
-# Aligns lighting per frame, removes cast/bounce shadows + lamp glare hotspots, and writes 256x256 crops
+### Step 2: YOLO Detection (`duplo-model/1`) + Background Subtraction, Glare Removal & Crop (`256x256`)
+```powershell
+# Set your Roboflow API key (sent strictly in 'Authorization: Bearer' header, never in query string)
+$env:ROBOFLOW_API_KEY = "YOUR_ROBOFLOW_API_KEY"
+
+# Test Roboflow Serverless 'duplo-model/1' YOLO detection on a single image
+python -m perception.yolo_duplo --image data/raw/mat/test/defect/realsense_rgb_20261114_104222_559.png --save-vis anomaly/results/yolo_vis.png
+
+# Segment strictly inside the YOLO bounding box, remove cast/bounce shadows + glare, and write 256x256 crops
 python -m perception.preprocess
 
 # Optional: generate hue-shifted copies in train/good to cover unseen brick colors
@@ -51,7 +57,7 @@ python -m perception.augment_hue
 ```
 
 ### Step 3: Train 3-Model Ensemble, Export OpenVINO IR, Calibrate Thresholds & Start Service
-```bash
+```powershell
 # 1. Train Anomalib 2.7.0 3-model ensemble (Padim + PatchCore + EfficientAd)
 python -m anomaly.train --model padim --version 1
 python -m anomaly.train --model patchcore --version 1
@@ -66,9 +72,8 @@ python -m anomaly.export --model efficient_ad --version 1 --precision fp16
 python -m anomaly.verify --device AUTO_INTEL --update-rules
 
 # 4. Inspect any single photo locally (prints JSON or --verdict-only 'perfect'/'defective' + optional heatmap PNG)
-python -m anomaly.evaluate \
-    --image data/raw/mat/test/defect/sample.png \
-    --save-vis anomaly/results/eval_vis.png
+python -m anomaly.evaluate --image data/raw/mat/test/defect/realsense_rgb_20261114_104222_559.png --save-vis anomaly/results/eval_vis.png
+python -m anomaly.evaluate --image data/raw/mat/test/defect/realsense_rgb_20261114_104222_559.png --verdict-only
 
 # 5. Start ZeroMQ service on tcp://127.0.0.1:5555 (replies ONLY "perfect" or "defective")
 python -m anomaly.service

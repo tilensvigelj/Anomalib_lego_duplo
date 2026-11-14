@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -21,6 +23,13 @@ from perception.duplo_rgbd_preprocess import (
     process_dataset_batch,
     remove_specular_glare,
     run_acceptance_test,
+)
+from perception.yolo_duplo import (
+    DEFAULT_DUPLO_MODEL_ID,
+    DEFAULT_ROBOFLOW_API_URL,
+    get_roboflow_client,
+    infer_duplo_image,
+    parse_yolo_predictions,
 )
 
 
@@ -412,6 +421,96 @@ class TestDuploRGBPreprocess(unittest.TestCase):
         white_out, white_glare = remove_specular_glare(white_crop, white_mask, cfg)
         self.assertEqual(int(np.count_nonzero(white_glare)), 0)
         np.testing.assert_array_equal(white_out, white_crop)
+
+    def test_roboflow_yolo_header_auth_and_bgr_conversion(self) -> None:
+        """Verify Roboflow client strictly uses Authorization: Bearer header transport and RGB->BGR conversion."""
+        with mock.patch.dict(os.environ, {"ROBOFLOW_API_KEY": "rf_unit_test_secret_key"}, clear=False):
+            client = get_roboflow_client(
+                api_url=DEFAULT_ROBOFLOW_API_URL,
+                confidence_threshold=0.25,
+                iou_threshold=0.45,
+            )
+            transport_val = str(client.inference_configuration.api_key_transport).lower()
+            self.assertIn("header", transport_val)
+            self.assertNotIn("query", transport_val)
+
+            rgb_img = np.zeros((120, 160, 3), dtype=np.uint8)
+            rgb_img[:, :] = (220, 40, 20)  # Pure red in RGB -> should become (20, 40, 220) in BGR!
+
+            fake_response = {
+                "image": {"width": 160, "height": 120},
+                "predictions": [
+                    {"x": 80.0, "y": 60.0, "width": 64.0, "height": 44.0, "confidence": 0.94, "class": "duplo"},
+                    {"x": 20.0, "y": 20.0, "width": 30.0, "height": 20.0, "confidence": 0.12, "class": "duplo"},
+                ],
+            }
+            with mock.patch.object(client, "infer", return_value=fake_response) as mock_infer:
+                raw = infer_duplo_image(rgb_img, model_id=DEFAULT_DUPLO_MODEL_ID, color_format="RGB")
+                self.assertEqual(raw, fake_response)
+                mock_infer.assert_called_once()
+                sent_arr = mock_infer.call_args[0][0]
+                self.assertEqual(mock_infer.call_args[1]["model_id"], "duplo-model/1")
+                self.assertIsInstance(sent_arr, np.ndarray)
+                # Confirm RGB -> BGR conversion happened before `inference_sdk` cv2.imencode('.jpg')
+                np.testing.assert_array_equal(sent_arr[0, 0], np.array([20, 40, 220], dtype=np.uint8))
+
+            dets = parse_yolo_predictions(fake_response, image_hw=(120, 160), min_confidence=0.25)
+            self.assertEqual(len(dets), 1)
+            self.assertEqual(dets[0].xyxy, (48, 38, 112, 82))
+            self.assertAlmostEqual(dets[0].confidence, 0.94)
+
+    def test_strict_yolo_roi_gating_prevents_area_too_large_on_moved_camera(self) -> None:
+        """When camera moves farther away, YOLO gating must search strictly inside the YOLO box."""
+        # Simulate distant camera: small 38x24 Duplo brick (~900px) PLUS massive uncalibrated bins/table outside
+        color, gt_mask = _make_synthetic_duplo_rgb_scene(
+            center=(320, 250),
+            brick_size=(38, 24),
+            angle_deg=18.0,
+            brick_rgb=(35, 95, 205),
+            cast_shadow=True,
+            low_contrast_patch=False,
+            noise_std=2.5,
+            rng_seed=901,
+        )
+        # Corrupt the outer 65% of the frame with huge bright/colored foreign bins (>150,000 px mismatch!)
+        cluttered = color.copy()
+        cv2.rectangle(cluttered, (0, 0), (190, 480), (210, 45, 75), -1)
+        cv2.rectangle(cluttered, (460, 0), (640, 480), (45, 175, 80), -1)
+        cv2.rectangle(cluttered, (190, 0), (460, 130), (40, 42, 48), -1)
+
+        gx, gy, gw, gh = cv2.boundingRect(gt_mask)
+        yolo_xyxy = (gx - 12, gy - 12, gx + gw + 18, gy + gh + 16)  # Includes adjacent cast shadow inside box!
+
+        cfg = PreprocessConfig.from_json("configs/defect_config.json")
+        crop_rgb, crop_mask, info = preprocess(cluttered, self.bg_model, cfg, yolo_box=yolo_xyxy)
+        self.assertTrue(info["valid"], msg=f"Expected valid YOLO-gated segmentation, got {info['reason']}")
+        self.assertTrue(info["yolo_used"])
+        self.assertEqual(info["yolo_box"], yolo_xyxy)
+
+        pred = info["full_mask"] > 0
+        # Zero pixels outside the padded YOLO region may ever be selected!
+        outside_yolo = np.ones_like(pred, dtype=bool)
+        outside_yolo[
+            max(0, yolo_xyxy[1] - 12) : min(480, yolo_xyxy[3] + 12),
+            max(0, yolo_xyxy[0] - 12) : min(640, yolo_xyxy[2] + 12),
+        ] = False
+        self.assertEqual(int(np.count_nonzero(pred & outside_yolo)), 0)
+
+        # Small distant brick must be accurately segmented without shadow leakage
+        gt = gt_mask > 0
+        iou = float(np.count_nonzero(pred & gt)) / float(max(1, np.count_nonzero(pred | gt)))
+        self.assertGreater(iou, 0.78, msg=f"Distant small brick IoU too low: {iou:.3f}")
+        self.assertGreater(int(np.count_nonzero(crop_mask)), 4000)
+
+        # When ROBOFLOW_API_KEY is set and `duplo-model/1` returns no detections, return `no_yolo_detection`
+        with mock.patch.dict(os.environ, {"ROBOFLOW_API_KEY": "rf_unit_test_secret_key"}, clear=False):
+            with mock.patch(
+                "perception.duplo_rgbd_preprocess.detect_best_duplo_box",
+                return_value=(None, [], {"predictions": []}),
+            ):
+                _, _, info_none = preprocess(cluttered, self.bg_model, replace(cfg, USE_YOLO=True))
+                self.assertFalse(info_none["valid"])
+                self.assertEqual(info_none["reason"], "no_yolo_detection")
 
 
 if __name__ == "__main__":
