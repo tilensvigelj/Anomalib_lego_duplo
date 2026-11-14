@@ -1,0 +1,84 @@
+# `j26` — Junction 2026 Intel Physical AI (Person C: Perception & Anomalib)
+
+Single-camera Duplo anomaly detection pipeline (`perception/`, `anomaly/`, `data/`, `configs/rules.yaml`).
+ZeroMQ service (`tcp://127.0.0.1:5555`) evaluates incoming camera frames using a parallel OpenVINO `PatchCore + PaDiM` ensemble and replies to the VLA with **only** `"perfect"` or `"defective"`.
+
+```text
+j26/
+├── configs/
+│   ├── rules.yaml               # Single binary threshold + per-model thresholds
+│   └── defect_config.json       # RGB preprocessing & Anomalib model parameters
+├── perception/                  # (C) RGB background subtraction, 256x256 crops, hue aug
+├── anomaly/                     # (C) Anomalib 2.7.0 train, OpenVINO export, ZeroMQ service (:5555)
+│   └── exports/                 # Versioned IRs: padim_mat_v3/, patchcore_mat_v4/, ...
+├── data/
+│   ├── calibration/             # Saved median background reference (background_mat.png)
+│   ├── raw/                     # <-- DROP RAW PHOTOS FROM THE SINGLE CAMERA HERE
+│   │   └── mat/
+│   │       ├── background/      # <-- Empty-scene photos WITHOUT the Duplo block
+│   │       ├── train/good/      # <-- Clean Duplo photos (printed numbers, curved, etc.)
+│   │       ├── test/good/       # <-- Held-out clean Duplo photos
+│   │       └── test/defect/     # <-- Defective Duplo photos (marker marks)
+│   └── processed/               # <-- AUTO-GENERATED 256x256 CROPS FOR ANOMALIB
+│       └── mat/{train/good, test/good, test/defect, ground_truth/defect}/
+├── orchestrator/                # (D) state machine, safety, capture
+├── policy/                      # (B) SmolVLA / ACT exports & scripted poses
+├── bench/                       # (D) latency & power CSVs / plots
+├── dashboard/                   # (D) live UI
+└── docs/                        # (D) write-up, diagrams, datasets.md
+```
+
+---
+
+## 1. End-to-End Workflow (Single Camera -> `"perfect"` | `"defective"`)
+
+### Step 1: Put Raw Photos in `data/raw/mat/`
+1. **Background photo set (no Duplo block):**
+   Put 5–30 RGB photos of the empty mat/background into `data/raw/mat/background/`
+   *(or capture directly: `python -m perception.capture_realsense background --count 15`)*.
+2. **Duplo block photos:**
+   - `data/raw/mat/train/good/` (clean bricks)
+   - `data/raw/mat/test/good/` (held-out clean bricks)
+   - `data/raw/mat/test/defect/` (bricks with marker marks)
+
+### Step 2: Subtract Background & Crop to `256x256` (`data/processed/mat/`)
+```bash
+# Aligns lighting per frame, removes cast/bounce shadows, and writes 256x256 crops to data/processed/mat/
+python -m perception.preprocess
+
+# Optional: generate hue-shifted copies in train/good to cover unseen brick colors
+python -m perception.augment_hue
+```
+
+### Step 3: Train, Export OpenVINO IR, Calibrate Threshold & Start Service
+```bash
+# 1. Train Anomalib 2.7.0 models (padim ~1 min, CPU-optimized patchcore ~2 min)
+python -m anomaly.train --model padim --version 3
+python -m anomaly.train --model patchcore --version 4
+
+# 2. Export to static [1, 3, 256, 256] OpenVINO IR -> anomaly/exports/<model>_mat_v<N>/weights/openvino/model.xml
+python -m anomaly.export --model padim --version 3 --precision fp16
+python -m anomaly.export --model patchcore --version 4 --precision fp16
+
+# 3. Calibrate single binary threshold per model into configs/rules.yaml & verify parallel ensemble
+python -m anomaly.verify --device CPU --update-rules
+
+# 4. Inspect any single photo locally (prints JSON or --verdict-only 'perfect'/'defective' + optional heatmap PNG)
+python -m anomaly.evaluate \
+    --image data/raw/mat/test/defect/sample.png \
+    --save-vis anomaly/results/eval_vis.png
+
+# 5. Start ZeroMQ service on tcp://127.0.0.1:5555 (replies ONLY "perfect" or "defective")
+python -m anomaly.service
+```
+
+---
+
+## 2. ZeroMQ VLA Service Contract (`anomaly.service`)
+- **Endpoint:** `tcp://127.0.0.1:5555` (`zmq.REP`)
+- **Accepted Request Formats:**
+  1. JSON string: `{"image": "<base64_png>"}` (optional `"crop": true` to force preprocessing)
+  2. Plain base64-encoded PNG/JPEG string
+  3. Raw binary PNG/JPEG bytes (`sock.send(png_bytes)`)
+- **Reply Format (`sock.recv_string()`):**
+  - Strictly `"perfect"` (`score < threshold` -> blue bin) or `"defective"` (`score >= threshold` or unreadable image -> pink bin).

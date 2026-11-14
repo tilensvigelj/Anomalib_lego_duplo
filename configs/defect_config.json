@@ -1,0 +1,32 @@
+{
+  "model": {
+    "model_type": "patchcore",
+    "version": 1,
+    "image_sensitivity": 0.50,
+    "pixel_sensitivity": 0.50,
+    "openvino_precision": "fp16",
+    "color_dev_chroma_thresh": 18.0,
+    "color_dev_dark_thresh": 35.0,
+    "min_defect_area_px": 6
+  },
+  "preprocess": {
+    "CHROMA_THRESH": 14.0,
+    "LUMA_BRIGHT_THRESH": 22.0,
+    "LUMA_DARK_THRESH": 48.0,
+    "GRAD_DIFF_THRESH": 28.0,
+    "BLUR_KERNEL": 5,
+    "MIN_AREA_PX": 800,
+    "MAX_AREA_PX": 120000,
+    "KERNEL": 5,
+    "CLOSE_KERNEL": 7,
+    "FILL_CONVEX_HULL": true,
+    "DILATE_PX": 2,
+    "BG_FILL": [128, 128, 128],
+    "FEATHER_SIGMA": 1.0,
+    "MARGIN": 0.10,
+    "OUT_SIZE": 256,
+    "COLOR_FORMAT": "RGB",
+    "CANONICALIZE_ROTATION": true,
+    "REJECT_BORDER_TOUCH": true
+  }
+}
